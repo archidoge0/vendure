@@ -7,7 +7,7 @@ import { getConnectionToken } from '@nestjs/typeorm';
 import { DEFAULT_COOKIE_NAME } from '@vendure/common/lib/shared-constants';
 import { Type } from '@vendure/common/lib/shared-types';
 import { satisfies } from 'semver';
-import { Connection, DataSourceOptions, EntitySubscriberInterface } from 'typeorm';
+import { Connection, DataSourceOptions, EntitySubscriberInterface, getMetadataArgsStorage } from 'typeorm';
 import cookieSession = require('cookie-session');
 
 import { tokenMethodIncludes } from './api/common/token-method-includes';
@@ -371,6 +371,7 @@ function checkPluginCompatibility(
  * Run the configuration functions of all plugins and return the final config object.
  */
 export async function runPluginConfigurations(config: RuntimeVendureConfig): Promise<RuntimeVendureConfig> {
+    const addedCustomFieldsKeys = addCustomFieldsKeysForPluginEntities(config);
     for (const plugin of config.plugins) {
         const configFn = getConfigurationFunction(plugin);
         if (typeof configFn === 'function') {
@@ -378,7 +379,34 @@ export async function runPluginConfigurations(config: RuntimeVendureConfig): Pro
             Object.assign(config, result);
         }
     }
+    // Remove the keys which no plugin used, so that the rest of the bootstrap
+    // treats those entities as if they had no custom fields config at all.
+    const customFields = config.customFields as Record<string, unknown[] | undefined>;
+    for (const entityName of addedCustomFieldsKeys) {
+        if (customFields[entityName]?.length === 0) {
+            delete customFields[entityName];
+        }
+    }
     return config;
+}
+
+/**
+ * Plugin entities which have a `customFields` property do not have an entry in the default
+ * customFields config. We add an empty array for each one so that plugin configuration
+ * functions can push custom fields onto them, the same as for core entities.
+ */
+function addCustomFieldsKeysForPluginEntities(config: RuntimeVendureConfig): string[] {
+    const customFields = config.customFields as Record<string, unknown[] | undefined>;
+    const embeddeds = getMetadataArgsStorage().embeddeds;
+    const addedKeys: string[] = [];
+    for (const entity of getEntitiesFromPlugins(config.plugins)) {
+        const hasCustomFields = embeddeds.some(e => e.target === entity && e.propertyName === 'customFields');
+        if (hasCustomFields && !customFields[entity.name]) {
+            customFields[entity.name] = [];
+            addedKeys.push(entity.name);
+        }
+    }
+    return addedKeys;
 }
 
 /**
