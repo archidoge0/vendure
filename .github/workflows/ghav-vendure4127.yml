@@ -1,0 +1,157 @@
+name: GHAV Vendure 4127 before
+on:
+    push:
+        branches: [codex/ghav-vendure4127-before]
+
+defaults:
+    run:
+        shell: bash
+
+concurrency:
+    group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+    cancel-in-progress: true
+
+jobs:
+    publish_install:
+        runs-on: ${{ matrix.os }}
+        permissions:
+            contents: read
+        strategy:
+            matrix:
+                os: [ubuntu-24.04]
+                node-version: [22.23.3, 24.21.0]
+            fail-fast: false
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+              with:
+                  ref: fe25af09208afde7ea200815f1b9046b0c9f1447
+                  persist-credentials: false
+            - name: Verify fixed source snapshot
+              run: |
+                  test "$(git rev-parse HEAD)" = 'fe25af09208afde7ea200815f1b9046b0c9f1447'
+                  test "$(git rev-parse HEAD^{tree})" = '6bc69ae615b976bf459b53508ad0427d567268a5'
+                  git switch -c ghav-fixed-source
+            - name: Use Node.js ${{ matrix.node-version }}
+              uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+              with:
+                  node-version: ${{ matrix.node-version }}
+            - name: Record toolchain and lockfile
+              run: |
+                  node --version
+                  npm --version
+                  sha256sum package-lock.json
+            - name: Install Verdaccio
+              run: |
+                  npm install -g verdaccio@6.10.4
+                  npm install -g wait-on@9.5.1
+                  tmp_registry_log=`mktemp`
+                  mkdir -p $HOME/.config/verdaccio
+                  cp -v ./.github/workflows/verdaccio/config.yaml $HOME/.config/verdaccio/config.yaml
+                  nohup verdaccio --config $HOME/.config/verdaccio/config.yaml &
+                  wait-on http://localhost:4873
+                  TOKEN_RES=$(curl -XPUT \
+                    -H "Content-type: application/json" \
+                    -d '{ "name": "test", "password": "test" }' \
+                    'http://localhost:4873/-/user/org.couchdb.user:test')
+                  TOKEN=$(echo "$TOKEN_RES" | jq -r '.token')
+                  npm set //localhost:4873/:_authToken $TOKEN
+            - name: Windows dependencies
+              if: matrix.os == 'windows-latest'
+              run: npm install -g @angular/cli
+            - name: npm install
+              run: |
+                  npm install
+              env:
+                  CI: true
+            - name: Publish to Verdaccio
+              run: |
+                  nohup verdaccio --config $HOME/.config/verdaccio/config.yaml &
+                  wait-on http://localhost:4873
+                  npx lerna publish prepatch --preid ci --no-push --no-git-tag-version --no-commit-hooks --force-publish "*" --yes --dist-tag ci --registry http://localhost:4873
+            - name: Install via @vendure/create
+              run: |
+                  mkdir -p $HOME/install
+                  cd $HOME/install
+                  nohup verdaccio --config $HOME/.config/verdaccio/config.yaml &
+                  wait-on http://localhost:4873
+                  npm set registry=http://localhost:4873
+                  npm dist-tag ls @vendure/create
+                  npx @vendure/create@ci test-app --ci --use-npm --log-level info
+            - name: Server smoke tests
+              run: |
+                  cd $HOME/install/test-app
+                  npm run dev &
+                  node $GITHUB_WORKSPACE/.github/workflows/scripts/smoke-tests
+            - name: Kill dev server after smoke tests
+              shell: bash
+              run: |
+                  # Kill everything on port 3000 so dashboard tests can start fresh
+                  # (npm run dev spawns child processes that aren't killed by killing the parent)
+                  if [[ "$RUNNER_OS" == "Windows" ]]; then
+                      # Windows: use netstat to find PID and taskkill
+                      netstat -ano | grep ':3000' | grep 'LISTENING' | awk '{print $5}' | head -1 | xargs -r taskkill //F //PID 2>/dev/null || true
+                  else
+                      # Linux/macOS: use lsof
+                      lsof -ti:3000 | xargs kill 2>/dev/null || true
+                  fi
+            - name: Copy files (Windows)
+              if: runner.os == 'Windows'
+              shell: pwsh
+              run: |
+                cd ~/install/test-app
+                New-Item -ItemType Directory -Force -Path src/plugins/test-plugin
+                Copy-Item "$env:GITHUB_WORKSPACE/.github/workflows/scripts/vite.config.mts" -Destination "./vite.config.mts"
+                Copy-Item "$env:GITHUB_WORKSPACE/.github/workflows/scripts/test-plugin/*" -Destination "src/plugins/test-plugin/" -Recurse -Force
+                Copy-Item "$env:GITHUB_WORKSPACE/.github/workflows/scripts/setup-test-plugin.js" -Destination "./setup-test-plugin.js"
+            - name: Copy files (Unix)
+              if: runner.os != 'Windows'
+              run: |
+                cd ~/install/test-app
+                mkdir -p src/plugins/test-plugin
+                cp "$GITHUB_WORKSPACE/.github/workflows/scripts/vite.config.mts" ./vite.config.mts
+                cp -r "$GITHUB_WORKSPACE/.github/workflows/scripts/test-plugin/." src/plugins/test-plugin/
+                cp "$GITHUB_WORKSPACE/.github/workflows/scripts/setup-test-plugin.js" ./setup-test-plugin.js
+            - name: Run setup script
+              shell: bash
+              run: |
+                cd ~/install/test-app
+                node setup-test-plugin.js
+            - name: Install Playwright
+              run: |
+                cd $GITHUB_WORKSPACE
+                npm install playwright@1.63.0 --no-save
+                npx playwright install-deps
+                npx playwright install chromium
+            - name: Start dashboard and run tests
+              run: |
+                cd ~/install/test-app
+                # start the dev server in the background
+                npm run dev &
+                DEV_PID=$!
+                # Wait for the dev server to be available (use /health endpoint, not root)
+                wait-on http://localhost:3000/health --timeout 60000
+                # Start the dashboard with --strictPort to fail fast if port is in use
+                npx vite --port 5173 --strictPort &
+                DASHBOARD_PID=$!
+                # Give Vite a moment to start or fail
+                sleep 3
+                # Check if Vite process is still running (it will exit immediately if port is in use)
+                if ! kill -0 $DASHBOARD_PID 2>/dev/null; then
+                    echo "Vite failed to start - port 5173 may be in use"
+                    exit 1
+                fi
+                # Wait for the dashboard to be available
+                wait-on http://localhost:5173 --timeout 120000
+                # Run the dashboard tests
+                node $GITHUB_WORKSPACE/.github/workflows/scripts/dashboard-tests.js
+                # Clean up dashboard process
+                kill $DASHBOARD_PID 2>/dev/null || true
+                # Clean up dev server process
+                kill $DEV_PID 2>/dev/null || true
+            - name: Upload dashboard test screenshots
+              if: always()
+              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+              with:
+                name: dashboard-test-screenshots-${{ matrix.os }}-${{ matrix.node-version }}
+                path: /tmp/dashboard-test-*.png
+                retention-days: 28
