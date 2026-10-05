@@ -1,0 +1,146 @@
+name: "ghav before: Publish & Install"
+"on":
+  push:
+    branches:
+      - ghav/dev/4127
+    paths:
+      - .ghav/before
+defaults:
+  run:
+    shell: bash
+jobs:
+  publish_install:
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            node-version: 20.x
+          - os: ubuntu-latest
+            node-version: 22.x
+          - os: ubuntu-latest
+            node-version: 24.x
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      - name: Install Verdaccio
+        run: |
+          npm install -g verdaccio
+          npm install -g wait-on
+          tmp_registry_log=`mktemp`
+          mkdir -p $HOME/.config/verdaccio
+          cp -v ./.github/workflows/verdaccio/config.yaml $HOME/.config/verdaccio/config.yaml
+          nohup verdaccio --config $HOME/.config/verdaccio/config.yaml &
+          wait-on http://localhost:4873
+          TOKEN_RES=$(curl -XPUT \
+            -H "Content-type: application/json" \
+            -d '{ "name": "test", "password": "test" }' \
+            'http://localhost:4873/-/user/org.couchdb.user:test')
+          TOKEN=$(echo "$TOKEN_RES" | jq -r '.token')
+          npm set //localhost:4873/:_authToken $TOKEN
+      - name: Windows dependencies
+        if: matrix.os == 'windows-latest'
+        run: npm install -g @angular/cli
+      - name: npm install
+        run: |
+          npm install
+        env:
+          CI: true
+      - name: Publish to Verdaccio
+        run: |
+          nohup verdaccio --config $HOME/.config/verdaccio/config.yaml &
+          wait-on http://localhost:4873
+          npx lerna publish prepatch --preid ci --no-push --no-git-tag-version --no-commit-hooks --force-publish "*" --yes --dist-tag ci --registry http://localhost:4873
+      - name: Install via @vendure/create
+        run: |
+          mkdir -p $HOME/install
+          cd $HOME/install
+          nohup verdaccio --config $HOME/.config/verdaccio/config.yaml &
+          wait-on http://localhost:4873
+          npm set registry=http://localhost:4873
+          npm dist-tag ls @vendure/create
+          npx @vendure/create@ci test-app --ci --use-npm --log-level info
+      - name: Server smoke tests
+        run: |
+          cd $HOME/install/test-app
+          npm run dev &
+          node $GITHUB_WORKSPACE/.github/workflows/scripts/smoke-tests
+      - name: Kill dev server after smoke tests
+        shell: bash
+        run: |
+          # Kill everything on port 3000 so dashboard tests can start fresh
+          # (npm run dev spawns child processes that aren't killed by killing the parent)
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+              # Windows: use netstat to find PID and taskkill
+              netstat -ano | grep ':3000' | grep 'LISTENING' | awk '{print $5}' | head -1 | xargs -r taskkill //F //PID 2>/dev/null || true
+          else
+              # Linux/macOS: use lsof
+              lsof -ti:3000 | xargs kill 2>/dev/null || true
+          fi
+      - name: Copy files (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cd ~/install/test-app
+          New-Item -ItemType Directory -Force -Path src/plugins/test-plugin
+          Copy-Item "$env:GITHUB_WORKSPACE/.github/workflows/scripts/vite.config.mts" -Destination "./vite.config.mts"
+          Copy-Item "$env:GITHUB_WORKSPACE/.github/workflows/scripts/test-plugin/*" -Destination "src/plugins/test-plugin/" -Recurse -Force
+          Copy-Item "$env:GITHUB_WORKSPACE/.github/workflows/scripts/setup-test-plugin.js" -Destination "./setup-test-plugin.js"
+      - name: Copy files (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          cd ~/install/test-app
+          mkdir -p src/plugins/test-plugin
+          cp "$GITHUB_WORKSPACE/.github/workflows/scripts/vite.config.mts" ./vite.config.mts
+          cp -r "$GITHUB_WORKSPACE/.github/workflows/scripts/test-plugin/." src/plugins/test-plugin/
+          cp "$GITHUB_WORKSPACE/.github/workflows/scripts/setup-test-plugin.js" ./setup-test-plugin.js
+      - name: Run setup script
+        shell: bash
+        run: |
+          cd ~/install/test-app
+          node setup-test-plugin.js
+      - name: Install Playwright
+        run: |
+          cd $GITHUB_WORKSPACE
+          npm install playwright
+          npx playwright install-deps
+          npx playwright install chromium
+      - name: Start dashboard and run tests
+        run: |
+          cd ~/install/test-app
+          # start the dev server in the background
+          npm run dev &
+          DEV_PID=$!
+          # Wait for the dev server to be available (use /health endpoint, not root)
+          wait-on http://localhost:3000/health --timeout 60000
+          # Start the dashboard with --strictPort to fail fast if port is in use
+          npx vite --port 5173 --strictPort &
+          DASHBOARD_PID=$!
+          # Give Vite a moment to start or fail
+          sleep 3
+          # Check if Vite process is still running (it will exit immediately if port is in use)
+          if ! kill -0 $DASHBOARD_PID 2>/dev/null; then
+              echo "Vite failed to start - port 5173 may be in use"
+              exit 1
+          fi
+          # Wait for the dashboard to be available
+          wait-on http://localhost:5173 --timeout 120000
+          # Run the dashboard tests
+          node $GITHUB_WORKSPACE/.github/workflows/scripts/dashboard-tests.js
+          # Clean up dashboard process
+          kill $DASHBOARD_PID 2>/dev/null || true
+          # Clean up dev server process
+          kill $DEV_PID 2>/dev/null || true
+      - name: Upload dashboard test screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dashboard-test-screenshots-${{ matrix.os }}-${{ matrix.node-version }}
+          path: /tmp/dashboard-test-*.png
+          retention-days: 28
